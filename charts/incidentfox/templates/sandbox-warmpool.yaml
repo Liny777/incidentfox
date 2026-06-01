@@ -1,0 +1,647 @@
+{{- if and .Values.services.agent.sandbox.enabled .Values.services.agent.warmPool.enabled }}
+# =============================================================================
+# Sandbox Warm Pool - Pre-warmed pods for instant sandbox provisioning
+# =============================================================================
+# Reduces sandbox startup from ~30-60s to <2s by maintaining a pool of ready pods.
+#
+# Architecture:
+# 1. SandboxWarmPool maintains N warm pods from the SandboxTemplate
+# 2. When investigation starts, a SandboxClaim binds to a warm pod (<1s)
+# 3. Server calls /claim endpoint to inject JWT and tenant context
+# 4. Pool controller replenishes claimed pods automatically
+#
+# Key difference from direct Sandbox creation:
+# - Envoy uses Lua filter to read JWT from file (not static header)
+# - Placeholder env vars are set at claim time via /claim endpoint
+# - Shared emptyDir volume for JWT injection between agent and Envoy
+# =============================================================================
+
+---
+# Envoy ConfigMap for warm pool pods
+# Uses Lua filter to dynamically read JWT from /tmp/sandbox-jwt
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: envoy-warmpool-config
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: incidentfox
+    component: envoy-warmpool
+    {{- include "incidentfox.labels" . | nindent 4 }}
+data:
+  envoy.yaml: |
+    admin:
+      address:
+        socket_address:
+          address: 127.0.0.1
+          port_value: 9901
+
+    static_resources:
+      listeners:
+      - name: http_proxy
+        address:
+          socket_address:
+            address: 0.0.0.0
+            port_value: 8001
+        filter_chains:
+        - filters:
+          - name: envoy.filters.network.http_connection_manager
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+              stat_prefix: credential_proxy
+              codec_type: AUTO
+
+              http_protocol_options:
+                allow_absolute_url: true
+
+              route_config:
+                name: proxy_routes
+                virtual_hosts:
+                - name: localhost_proxy
+                  domains:
+                  - "localhost:8001"
+                  - "127.0.0.1:8001"
+                  - "localhost"
+                  routes:
+                  # LLM API paths -> credential-resolver LLM proxy
+                  - match:
+                      prefix: "/v1/"
+                    route:
+                      cluster: credential_resolver_llm
+                      timeout: 0s
+                      idle_timeout: 0s
+                  - match:
+                      prefix: "/api/event_logging/"
+                    route:
+                      cluster: credential_resolver_llm
+                      timeout: 0s
+                      idle_timeout: 0s
+                  # Coralogix API paths
+                  - match:
+                      prefix: "/api/v1/dataprime/"
+                    route:
+                      cluster: coralogix_us2
+                      auto_host_rewrite: true
+                  - match:
+                      prefix: "/api/v1/query"
+                    route:
+                      cluster: coralogix_us2
+                      auto_host_rewrite: true
+
+                - name: anthropic
+                  domains:
+                  - "api.anthropic.com"
+                  - "api.anthropic.com:443"
+                  routes:
+                  - match:
+                      prefix: "/"
+                    route:
+                      cluster: credential_resolver_llm
+                      timeout: 0s
+                      idle_timeout: 0s
+
+                - name: coralogix_us2
+                  domains:
+                  - "api.us2.coralogix.com"
+                  - "api.us2.coralogix.com:443"
+                  routes:
+                  - match:
+                      prefix: "/"
+                    route:
+                      cluster: coralogix_us2
+                      auto_host_rewrite: true
+
+                - name: passthrough
+                  domains:
+                  - "*"
+                  routes:
+                  - match:
+                      prefix: "/"
+                    route:
+                      cluster: passthrough_cluster
+                      auto_host_rewrite: true
+
+              http_filters:
+              # Lua filter: Read JWT from file and add as header
+              - name: envoy.filters.http.lua
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+                  default_source_code:
+                    inline_string: |
+                      function envoy_on_request(request_handle)
+                        local f = io.open("/tmp/sandbox-jwt", "r")
+                        if f then
+                          local jwt = f:read("*all")
+                          f:close()
+                          jwt = jwt:gsub("^%s*(.-)%s*$", "%1")
+                          if jwt ~= "" then
+                            request_handle:headers():add("x-sandbox-jwt", jwt)
+                          end
+                        end
+                      end
+
+              # ext_authz filter - calls credential-resolver for auth headers
+              - name: envoy.filters.http.ext_authz
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+                  transport_api_version: V3
+                  http_service:
+                    server_uri:
+                      uri: http://credential-resolver-svc.{{ .Values.namespace }}.svc.cluster.local:8002/check
+                      cluster: ext_authz
+                      timeout: 2s
+                    path_prefix: "/extauthz"
+                    authorization_request:
+                      allowed_headers:
+                        patterns:
+                        - exact: "x-sandbox-jwt"
+                        - exact: "x-tenant-id"
+                        - exact: "x-team-id"
+                      headers_to_add:
+                      - key: "x-original-host"
+                        value: "%REQ(:authority)%"
+                    authorization_response:
+                      allowed_upstream_headers:
+                        patterns:
+                        - exact: "authorization"
+                        - exact: "x-api-key"
+                        - exact: "x-tenant-id"
+                        - exact: "x-team-id"
+                        - exact: "x-llm-model"
+                  failure_mode_allow: false
+
+              - name: envoy.filters.http.router
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+      # TLS listener for gh CLI (requires HTTPS)
+      # Terminates TLS locally, forwards to credential-resolver HTTP
+      - name: gh_tls_proxy
+        address:
+          socket_address:
+            address: 0.0.0.0
+            port_value: 8443
+        filter_chains:
+        - filters:
+          - name: envoy.filters.network.http_connection_manager
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+              stat_prefix: gh_tls_proxy
+              codec_type: AUTO
+              route_config:
+                name: gh_routes
+                virtual_hosts:
+                - name: gh_proxy
+                  domains: ["*"]
+                  routes:
+                  - match:
+                      prefix: "/"
+                    route:
+                      cluster: credential_resolver_github
+                      timeout: 30s
+              http_filters:
+              # Lua filter: Read JWT from file and add as header
+              - name: envoy.filters.http.lua
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+                  default_source_code:
+                    inline_string: |
+                      function envoy_on_request(request_handle)
+                        local f = io.open("/tmp/sandbox-jwt", "r")
+                        if f then
+                          local jwt = f:read("*all")
+                          f:close()
+                          jwt = jwt:gsub("^%s*(.-)%s*$", "%1")
+                          if jwt ~= "" then
+                            request_handle:headers():add("x-sandbox-jwt", jwt)
+                          end
+                        end
+                      end
+              - name: envoy.filters.http.ext_authz
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.filters.http.ext_authz.v3.ExtAuthz
+                  transport_api_version: V3
+                  http_service:
+                    server_uri:
+                      uri: http://credential-resolver-svc.{{ .Values.namespace }}.svc.cluster.local:8002/check
+                      cluster: ext_authz
+                      timeout: 2s
+                    path_prefix: "/extauthz"
+                    authorization_request:
+                      allowed_headers:
+                        patterns:
+                        - exact: "x-sandbox-jwt"
+                      headers_to_add:
+                      - key: "x-original-host"
+                        value: "github.com"
+                    authorization_response:
+                      allowed_upstream_headers:
+                        patterns:
+                        - exact: "authorization"
+                        - exact: "x-api-key"
+                  failure_mode_allow: false
+              - name: envoy.filters.http.router
+                typed_config:
+                  "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_certificates:
+                - certificate_chain:
+                    filename: /etc/envoy/gh-tls/credential-resolver.crt
+                  private_key:
+                    filename: /etc/envoy/gh-tls/credential-resolver.key
+
+      clusters:
+      - name: ext_authz
+        type: STRICT_DNS
+        lb_policy: ROUND_ROBIN
+        load_assignment:
+          cluster_name: ext_authz
+          endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: credential-resolver-svc.{{ .Values.namespace }}.svc.cluster.local
+                    port_value: 8002
+
+      - name: credential_resolver_llm
+        type: STRICT_DNS
+        lb_policy: ROUND_ROBIN
+        load_assignment:
+          cluster_name: credential_resolver_llm
+          endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: credential-resolver-svc.{{ .Values.namespace }}.svc.cluster.local
+                    port_value: 8002
+
+      - name: anthropic
+        type: LOGICAL_DNS
+        dns_lookup_family: V4_ONLY
+        lb_policy: ROUND_ROBIN
+        load_assignment:
+          cluster_name: anthropic
+          endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: api.anthropic.com
+                    port_value: 443
+        transport_socket:
+          name: envoy.transport_sockets.tls
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+            sni: api.anthropic.com
+
+      - name: coralogix_us2
+        type: LOGICAL_DNS
+        dns_lookup_family: V4_ONLY
+        lb_policy: ROUND_ROBIN
+        load_assignment:
+          cluster_name: coralogix_us2
+          endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: api.us2.coralogix.com
+                    port_value: 443
+        transport_socket:
+          name: envoy.transport_sockets.tls
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+            sni: api.us2.coralogix.com
+
+      - name: passthrough_cluster
+        type: LOGICAL_DNS
+        dns_lookup_family: V4_ONLY
+        lb_policy: ROUND_ROBIN
+        load_assignment:
+          cluster_name: passthrough_cluster
+          endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: localhost
+                    port_value: 9999
+
+      # GitHub API via credential-resolver (for gh CLI TLS proxy)
+      - name: credential_resolver_github
+        type: STRICT_DNS
+        lb_policy: ROUND_ROBIN
+        load_assignment:
+          cluster_name: credential_resolver_github
+          endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: credential-resolver-svc.{{ .Values.namespace }}.svc.cluster.local
+                    port_value: 8002
+
+---
+# Self-signed TLS cert for Envoy gh CLI proxy (pod-internal traffic only)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: envoy-gh-tls-cert
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: incidentfox
+    component: envoy-warmpool
+    {{- include "incidentfox.labels" . | nindent 4 }}
+data:
+  credential-resolver.crt: |
+    -----BEGIN CERTIFICATE-----
+    MIIEMzCCAxugAwIBAgIUA2FP0KdHpG0c03EU+FHhVp4bycEwDQYJKoZIhvcNAQEL
+    BQAwHjEcMBoGA1UEAwwTY3JlZGVudGlhbC1yZXNvbHZlcjAeFw0yNjAyMjcwODQ1
+    NDFaFw0zNjAyMjUwODQ1NDFaMB4xHDAaBgNVBAMME2NyZWRlbnRpYWwtcmVzb2x2
+    ZXIwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCt3A5y4H4JwkRe8ZR2
+    G4utAChRSAxRyXqWAvoeUOaOku9VMIT7JPxV88i8upjw2SxLIXY/zVRFKCtWLHYa
+    S2RgJ8DvqZZ5hkHCZzr0IWE8zVAyabwBUAQ0DA8krAZNtBlplQdVRyPoJbWDQGIK
+    jsoYZKascXCvNS0RM8AceaCeA+kUbImFvT4KUIStCC9tMx6CVSoX6QmDXQwMtEsE
+    3u5J/2YqbrzY5TYyONIUEbwdL47Ggww9jXTQ+z4tN4hYt0nkgg4S/Rbbzbg3rLEv
+    PpxcClVRMMFcWoiprGQmMy8LdHKI5hmIXVUw9Ji0/DblZnoEAM4+doVIB0sqq4IV
+    CQJjAgMBAAGjggFnMIIBYzAdBgNVHQ4EFgQUNn5UjGKqAwkdVgoO4OIFjjsZNaAw
+    HwYDVR0jBBgwFoAUNn5UjGKqAwkdVgoO4OIFjjsZNaAwDwYDVR0TAQH/BAUwAwEB
+    /zCCAQ4GA1UdEQSCAQUwggEBghNjcmVkZW50aWFsLXJlc29sdmVyghdjcmVkZW50
+    aWFsLXJlc29sdmVyLXN2Y4IjY3JlZGVudGlhbC1yZXNvbHZlci1zdmMuaW5jaWRl
+    bnRmb3iCKGNyZWRlbnRpYWwtcmVzb2x2ZXItc3ZjLmluY2lkZW50Zm94LXByb2SC
+    NWNyZWRlbnRpYWwtcmVzb2x2ZXItc3ZjLmluY2lkZW50Zm94LnN2Yy5jbHVzdGVy
+    LmxvY2FsgjpjcmVkZW50aWFsLXJlc29sdmVyLXN2Yy5pbmNpZGVudGZveC1wcm9k
+    LnN2Yy5jbHVzdGVyLmxvY2Fsgglsb2NhbGhvc3SHBH8AAAEwDQYJKoZIhvcNAQEL
+    BQADggEBAGyEjDhe+KmMUbFsuaKTjITF5YgHwQz+de8OlCRZ3/jx0+QYn9h0Hmau
+    yAQ4ZjItsNZQXTOLp6pKfFHV3jD44zHHGNV8y4g0yJBbzI4dbt30F8VVTHZ/yN+i
+    aqTr8HCPalWpf/dEUWTCb6TJQTjLzomGat9+azDEzxPZBTJxj7ZnHkwPl6vfGr4V
+    seKCbO8YKR2uzB9IRuweBmicmi6Gd3WnzrH56/X8UbSF4+UVabvsG8ixyupg8iDj
+    mWBtQlVhWlCV9XHXbSXc9+eZiWHI8XBlR2Gz6yfWD8cPm7pVDFCFgsBkeZd9yYon
+    hF8ALxZoqSKFOI0nOQvTiLiM3BUInwI=
+    -----END CERTIFICATE-----
+  credential-resolver.key: |
+    -----BEGIN PRIVATE KEY-----
+    MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCt3A5y4H4JwkRe
+    8ZR2G4utAChRSAxRyXqWAvoeUOaOku9VMIT7JPxV88i8upjw2SxLIXY/zVRFKCtW
+    LHYaS2RgJ8DvqZZ5hkHCZzr0IWE8zVAyabwBUAQ0DA8krAZNtBlplQdVRyPoJbWD
+    QGIKjsoYZKascXCvNS0RM8AceaCeA+kUbImFvT4KUIStCC9tMx6CVSoX6QmDXQwM
+    tEsE3u5J/2YqbrzY5TYyONIUEbwdL47Ggww9jXTQ+z4tN4hYt0nkgg4S/Rbbzbg3
+    rLEvPpxcClVRMMFcWoiprGQmMy8LdHKI5hmIXVUw9Ji0/DblZnoEAM4+doVIB0sq
+    q4IVCQJjAgMBAAECggEANFWC1eqklexv50KCBYFqLJPZDwqIhtAGwgQ4ZQrGNBGf
+    0H1v8idie78L5F+o7Qr6bc0vSqpUnRKn5OMyU9zw5I7i4WGjpYYX4lxvnxAzNHm7
+    E8nHKX/8G+yrXEcaCKbXZXRSRkXJVbaQKmele3ca93fIwizNljgEDmMNB6VHB3k3
+    xBahtlxRU6kKeUSK0bce4GO2HYkGVdCs8Ol3usxE5aX6SaxfG5GncAeav083jllo
+    VLf6NkdH7x3Z7KYGDEHQpoyiXqgV64QKX5x2IxEkbDIMWS0Pfl8FyQwW6F2Pa7M1
+    buU+AA2jaMtJs48ddB8SACFCxpRwKQiuzO+FdFVSNQKBgQDbKqFCdz7o1TMhXVkX
+    rM5HpRyiBEU/MROt26ACA6ggBLggQ8krXxmxDQKq7uVJ+TrgmvoIxte/TTobjM/q
+    IB6aAJsqJgwOKbOvQYZS/htpZgB8RapUa0uUk92Us8fxPszQG5sWSAqIC+Wx/XiU
+    jqFFSXG+t1BW/amV3gGlZ2oHxQKBgQDLFCbU36+NK5XFpUC5UOKNC6GZJP6VkPiO
+    2oZtZrf8wtf4xx+/bWsQOnk2pan451xtd08tQjml4qtrBIjUY53IG1J5wi1Svx4y
+    DPVxMIseE7eAv3Z0lFHGh3ktTWPXRdShPPpjnqTBwiwgBJejQdn19rxCllXyAdCT
+    F0/KmnhcBwKBgQDT33ZdxuGuPM1dJ90FIi2Y3Wm8xtwaptsbbAJXcCmMKoPFzUIh
+    B6LSon09ug03YhUlJS0qZvATJBlUoOAuujZbMtLOAFIPLwliF7o/aSAe2FkHymFL
+    kx5R2FCRfOuBsPBXDxjyhVqJAtdfJmb3VptZXBL2CElGj5ruItz8heje8QKBgQCb
+    kp6E6a+0+DTOquBAl2RXJRfxGFQoBF1GIsZkvRIqAqItJW5+2bXxQrplUNg7pBI8
+    kfAH/fnnyRQE8f5Yps/S4ot2V3kdMOhS83Z79fI9YmFrskFu4ckby+DbAbSA0DAq
+    LWqsMnaJMNVY2evI18PAF/r1D/JbaWR9qpgn39pgtQKBgHeTQbL3ogPHt6F99TQX
+    44JJpwTLdd5N4kspdVlAJikOUpntNRwJ7gYydI8h8Cjo4MEw2WW5Ljh9XDXYT9Lo
+    rQaU5JyYvEY4tdRjy0CFJJBM62sirGsJtU04Ny8xeE/WgU/Mc+O7rTYeKLhkSD9U
+    hvP05Lc9hWD9i/178HKOZSWr
+    -----END PRIVATE KEY-----
+
+---
+# SandboxTemplate - Pod template for warm pool
+apiVersion: extensions.agents.x-k8s.io/v1alpha1
+kind: SandboxTemplate
+metadata:
+  name: {{ .Values.services.agent.warmPool.templateName }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: incidentfox
+    component: warmpool-template
+    {{- include "incidentfox.labels" . | nindent 4 }}
+spec:
+  podTemplate:
+    metadata:
+      labels:
+        app: incidentfox-agent
+        component: warmpool
+        warmpool: "true"
+        incidentfox.io/isolation: sandbox
+    spec:
+      serviceAccountName: {{ .Release.Name }}-sandbox-pod
+      # When directK8s=true, mount SA token for direct K8s API access (e.g. flagd).
+      # When false (default), all K8s queries go through k8s-gateway.
+      automountServiceAccountToken: {{ .Values.services.agent.sandbox.directK8s | default false }}
+      {{- if .Values.services.agent.sandbox.useGvisor }}
+      runtimeClassName: gvisor
+      {{- end }}
+
+      containers:
+      # Main agent container
+      - name: agent
+        image: {{ .Values.services.agent.sandbox.image | default .Values.services.agent.image }}
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8888
+          name: sandbox
+        env:
+        # Placeholder values - set at claim time via /claim endpoint
+        - name: INCIDENTFOX_TENANT_ID
+          value: "unclaimed"
+        - name: INCIDENTFOX_TEAM_ID
+          value: "unclaimed"
+        - name: THREAD_ID
+          value: "unclaimed"
+        # Config Service URL (must use correct namespace for DNS)
+        - name: CONFIG_SERVICE_URL
+          value: "http://incidentfox-config-service.{{ .Values.namespace }}.svc.cluster.local:8080"
+        # Claude SDK: route API requests through Envoy proxy
+        - name: ANTHROPIC_BASE_URL
+          value: "http://localhost:8001"
+        # Placeholder API key - Envoy injects real one via ext_authz
+        - name: ANTHROPIC_API_KEY
+          value: "sk-ant-placeholder-proxy-will-inject-real-key"
+        # Coralogix SDK: route API requests through Envoy proxy
+        - name: CORALOGIX_BASE_URL
+          value: "http://localhost:8001"
+        # Integration proxies: route through credential-resolver reverse proxy
+        # These integrations have customer-specific URLs, so credential-resolver
+        # looks up the real URL from config-service and injects auth headers.
+        - name: CONFLUENCE_BASE_URL
+          value: "http://credential-resolver-svc.{{ .Values.namespace }}.svc.cluster.local:8002/confluence"
+        - name: GRAFANA_BASE_URL
+          value: "http://credential-resolver-svc.{{ .Values.namespace }}.svc.cluster.local:8002/grafana"
+        - name: ELASTICSEARCH_BASE_URL
+          value: "http://credential-resolver-svc.{{ .Values.namespace }}.svc.cluster.local:8002/elasticsearch"
+        - name: PROMETHEUS_BASE_URL
+          value: "http://credential-resolver-svc.{{ .Values.namespace }}.svc.cluster.local:8002/prometheus"
+        - name: JAEGER_BASE_URL
+          value: "http://credential-resolver-svc.{{ .Values.namespace }}.svc.cluster.local:8002/jaeger"
+        - name: GITHUB_BASE_URL
+          value: "http://credential-resolver-svc.{{ .Values.namespace }}.svc.cluster.local:8002/github"
+        - name: DATADOG_BASE_URL
+          value: "http://credential-resolver-svc.{{ .Values.namespace }}.svc.cluster.local:8002/datadog"
+        - name: AMPLITUDE_BASE_URL
+          value: "http://credential-resolver-svc.{{ .Values.namespace }}.svc.cluster.local:8002/amplitude"
+        - name: VERCEL_BASE_URL
+          value: "http://credential-resolver-svc.{{ .Values.namespace }}.svc.cluster.local:8002/vercel"
+        - name: SLACK_BASE_URL
+          value: "http://credential-resolver-svc.{{ .Values.namespace }}.svc.cluster.local:8002/slack"
+        # Credential resolver URL for SDK-based integrations (AWS, Azure, GCP)
+        - name: CREDENTIAL_RESOLVER_URL
+          value: "http://credential-resolver-svc.{{ .Values.namespace }}.svc.cluster.local:8002"
+        # Git URL rewriting: route github.com HTTPS through credential-resolver
+        - name: GIT_CONFIG_COUNT
+          value: "1"
+        - name: GIT_CONFIG_KEY_0
+          value: "url.http://credential-resolver-svc.{{ .Values.namespace }}.svc.cluster.local:8002/git/.insteadOf"
+        - name: GIT_CONFIG_VALUE_0
+          value: "https://github.com/"
+        # gh CLI: route HTTPS API calls through Envoy TLS listener (localhost)
+        - name: GH_HOST
+          value: "localhost:8443"
+        # gh CLI: placeholder token — Envoy ext_authz injects the real one
+        # (same pattern as ANTHROPIC_API_KEY placeholder above)
+        - name: GH_ENTERPRISE_TOKEN
+          value: "placeholder-proxy-will-inject-real-token"
+        # Trust the self-signed TLS cert used by the Envoy gh proxy listener.
+        # Safe in sandbox: all external HTTPS is proxied through HTTP.
+        - name: SSL_CERT_FILE
+          value: "/etc/ssl/gh-proxy/credential-resolver.crt"
+        # K8s Gateway: route K8s commands to customer clusters via k8s-agent
+        - name: K8S_GATEWAY_URL
+          value: "http://incidentfox-k8s-gateway.{{ .Values.namespace }}.svc.cluster.local:8085"
+        # RAPTOR knowledge base: internal K8s service (no auth needed)
+        - name: RAPTOR_URL
+          value: "http://incidentfox-rag.{{ .Values.namespace }}.svc.cluster.local:8000"
+        # flagd runtime config (for OTel Demo incident scenarios)
+        - name: FLAGD_NAMESPACE
+          value: "otel-demo"
+        - name: FLAGD_CONFIGMAP
+          value: "flagd-config"
+        # =================================================================
+        # Agent Observability (LLM tracing — Langfuse / Laminar)
+        # =================================================================
+        {{- $obs := .Values.services.agent.agentObservability }}
+        {{- if and $obs (ne ($obs.backend | default "none") "none") }}
+        - name: OBSERVABILITY_BACKEND
+          value: {{ $obs.backend | quote }}
+        {{- if eq $obs.backend "langfuse" }}
+        - name: LANGFUSE_HOST
+          value: {{ $obs.langfuse.host | default "https://us.cloud.langfuse.com" | quote }}
+        - name: LANGFUSE_PUBLIC_KEY
+          valueFrom:
+            secretKeyRef:
+              name: {{ $obs.langfuse.secretName }}
+              key: {{ $obs.langfuse.publicKeyKey }}
+        - name: LANGFUSE_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: {{ $obs.langfuse.secretName }}
+              key: {{ $obs.langfuse.secretKeyKey }}
+        {{- else if eq $obs.backend "laminar" }}
+        - name: LMNR_PROJECT_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: {{ $obs.laminar.secretName }}
+              key: {{ $obs.laminar.apiKeyKey }}
+        {{- end }}
+        {{- end }}
+        # Disable Laminar's claude-agent-sdk instrumentation
+        - name: DISABLE_LAMINAR
+          value: "true"
+        # Kubernetes: use in-cluster service account auth (incidentfox-sandbox-pod SA)
+        # NOT kubeconfig — that resolves to the EC2 node IAM identity via aws eks get-token
+        - name: SANDBOX_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        volumeMounts:
+        # Shared volume for JWT injection (Envoy reads, /claim writes)
+        - name: jwt-volume
+          mountPath: /tmp
+        # Self-signed TLS cert for gh CLI → Envoy proxy (agent needs to trust it)
+        - name: gh-tls-cert
+          mountPath: /etc/ssl/gh-proxy
+          readOnly: true
+        resources:
+{{ toYaml .Values.services.agent.warmPool.agentResources | indent 10 }}
+        securityContext:
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          runAsUser: 1000
+          capabilities:
+            drop:
+            - ALL
+
+      # Envoy sidecar - handles credential injection via ext_authz
+      - name: envoy
+        image: {{ .Values.services.agent.warmPool.envoyImage }}
+        args:
+        - "--config-path"
+        - "/etc/envoy/envoy.yaml"
+        - "--log-level"
+        - "warn"
+        ports:
+        - containerPort: 8001
+          name: proxy
+        - containerPort: 8443
+          name: gh-tls
+        volumeMounts:
+        - name: envoy-config
+          mountPath: /etc/envoy
+          readOnly: true
+        - name: gh-tls-cert
+          mountPath: /etc/envoy/gh-tls
+          readOnly: true
+        - name: jwt-volume
+          mountPath: /tmp
+        resources:
+{{ toYaml .Values.services.agent.warmPool.envoyResources | indent 10 }}
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+
+      volumes:
+      - name: envoy-config
+        configMap:
+          name: envoy-warmpool-config
+      - name: gh-tls-cert
+        configMap:
+          name: envoy-gh-tls-cert
+      - name: jwt-volume
+        emptyDir:
+          sizeLimit: 1Mi
+
+---
+# SandboxWarmPool - Maintains pre-warmed pods
+apiVersion: extensions.agents.x-k8s.io/v1alpha1
+kind: SandboxWarmPool
+metadata:
+  name: {{ .Values.services.agent.warmPool.poolName }}
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: incidentfox
+    component: warmpool
+    {{- include "incidentfox.labels" . | nindent 4 }}
+spec:
+  sandboxTemplateRef:
+    name: {{ .Values.services.agent.warmPool.templateName }}
+  replicas: {{ .Values.services.agent.warmPool.replicas }}
+
+{{- end }}

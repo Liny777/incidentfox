@@ -1,0 +1,31 @@
+[project]
+name = "credential-resolver"
+version = "0.1.0"
+description = "Credential resolver service for IncidentFox SRE Agent"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.109.0",
+    "uvicorn>=0.27.0",
+    "httpx>=0.26.0",
+    "cachetools>=5.3.0",
+    "pydantic>=2.5.0",
+    "pydantic-settings>=2.1.0",
+    "pyjwt[crypto]>=2.8.0",
+    "boto3>=1.39.0",  # For AWS Secrets Manager + Bedrock API key support
+    "awscrt>=0.29.0",  # For Bedrock API key (bearer token) authentication
+    "litellm>=1.55.0",  # Multi-provider LLM routing for non-Claude models
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.23.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/credential_resolver"]

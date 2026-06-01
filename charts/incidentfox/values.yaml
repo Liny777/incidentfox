@@ -1,0 +1,772 @@
+namespace: incidentfox
+
+global:
+  imagePullPolicy: IfNotPresent
+
+  # Image pull secrets (empty - ECR auth handled via IAM roles)
+  imagePullSecrets: []
+
+  # External DB (recommended). Provide via External Secrets -> K8s Secret -> env.
+  database:
+    # If you want each service to share a single DATABASE_URL secret:
+    databaseUrlSecretName: incidentfox-database-url
+    databaseUrlSecretKey: DATABASE_URL
+
+  configService:
+    url: "" # e.g. http://incidentfox-config-service.incidentfox.svc.cluster.local:8080
+    orgId: "pilot"
+
+  # Public URL for the web UI (used by slack-bot for links in messages)
+  webUiUrl: ""
+
+ingress:
+  enabled: true
+  className: alb
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internal
+    alb.ingress.kubernetes.io/target-type: ip
+  host: "" # optional hostname
+  tls:
+    enabled: false
+    certificateArn: "" # ACM cert ARN for your custom domain
+    redirectToHttps: true
+  waf:
+    enabled: false
+    webAclArn: "" # AWS WAFv2 Web ACL ARN
+
+externalSecrets:
+  enabled: true
+  # API version for ESO resources. With modern ESO, v1 is served; some older clusters may require v1beta1.
+  apiVersion: external-secrets.io/v1
+  installClusterSecretStore: true
+  awsRegion: us-west-2
+  # These are examples; customers will map to their own secrets layout.
+  # Required secrets contract (K8s Secret names/keys) and example remote refs.
+  # Adapt the `remoteRef.key` strings to match your Secrets Manager names.
+  contract:
+    databaseUrl:
+      enabled: true
+      secretName: incidentfox-database-url
+      secretKey: DATABASE_URL
+      remoteRefKey: incidentfox/prod/database_url
+    configService:
+      enabled: true
+      secretName: incidentfox-config-service
+      adminTokenKey: ADMIN_TOKEN
+      tokenPepperKey: TOKEN_PEPPER
+      impersonationJwtSecretKey: IMPERSONATION_JWT_SECRET
+      adminTokenRemoteRefKey: incidentfox/prod/config_service_admin_token
+      tokenPepperRemoteRefKey: incidentfox/prod/config_service_token_pepper
+      impersonationJwtSecretRemoteRefKey: incidentfox/prod/config_service_impersonation_jwt_secret
+    agentOpenAI:
+      enabled: true
+      secretName: incidentfox-openai
+      apiKeyKey: api_key
+      apiKeyRemoteRefKey: incidentfox/prod/openai_api_key
+    webUiOidc:
+      enabled: false
+      secretName: incidentfox-web-ui-oidc
+      clientSecretKey: client_secret
+      clientSecretRemoteRefKey: incidentfox/prod/web_ui_oidc_client_secret
+    slack:
+      enabled: false
+      secretName: incidentfox-slack
+      signingSecretKey: signing_secret
+      botTokenKey: bot_token
+      signingSecretRemoteRefKey: incidentfox/prod/slack_signing_secret
+      botTokenRemoteRefKey: incidentfox/prod/slack_bot_token
+    github:
+      enabled: false
+      secretName: incidentfox-github
+      webhookSecretKey: GITHUB_WEBHOOK_SECRET
+      # GitHub App secret contains multiple keys; we extract just the webhook secret
+      remoteRefKey: incidentfox/extend/github-app
+      remoteRefProperty: GITHUB_WEBHOOK_SECRET
+    pagerduty:
+      enabled: false
+      secretName: incidentfox-pagerduty
+      webhookSecretKey: webhook_secret
+      remoteRefKey: incidentfox/prod/pagerduty_webhook_secret
+    incidentio:
+      enabled: false
+      secretName: incidentfox-incidentio
+      webhookSecretKey: webhook_secret
+      remoteRefKey: incidentfox/prod/incidentio_webhook_secret
+    orchestratorInternal:
+      enabled: false
+      secretName: incidentfox-orchestrator-internal
+      internalTokenKey: internal_token
+      internalTokenRemoteRefKey: incidentfox/prod/orchestrator_internal_token
+    # Langfuse tracing (optional)
+    langfuse:
+      enabled: false
+      secretName: incidentfox-langfuse
+      publicKeyKey: LANGFUSE_PUBLIC_KEY
+      secretKeyKey: LANGFUSE_SECRET_KEY
+      publicKeyRemoteRefKey: incidentfox/prod/langfuse_public_key
+      secretKeyRemoteRefKey: incidentfox/prod/langfuse_secret_key
+    newRelic:
+      enabled: true
+      secretName: incidentfox-newrelic
+      apiKeyKey: NEW_RELIC_API_KEY
+      apiKeyRemoteRefKey: incidentfox/prod/newrelic_api_key
+    # Recall.ai for real-time meeting transcription
+    recall:
+      enabled: true
+      secretName: incidentfox-recall
+      apiKeyKey: RECALL_API_KEY
+      webhookSecretKey: RECALL_WEBHOOK_SECRET
+      apiKeyRemoteRefKey: incidentfox/prod/recall_api_key
+      webhookSecretRemoteRefKey: incidentfox/prod/recall_webhook_secret
+      botName: "IncidentFox Notetaker"
+      botImageUrl: "https://incidentfox-assets.s3.us-west-2.amazonaws.com/bot-avatar.png"
+    # Google Chat integration
+    googleChat:
+      enabled: false
+      secretName: incidentfox-google-chat
+      projectIdKey: project_id
+      serviceAccountKeyKey: service_account_key
+      projectIdRemoteRefKey: incidentfox/prod/google_chat_project_id
+      serviceAccountKeyRemoteRefKey: incidentfox/prod/google_chat_service_account_key
+    # MS Teams integration
+    teams:
+      enabled: false
+      secretName: incidentfox-teams
+      appIdKey: app_id
+      appPasswordKey: app_password
+      tenantIdKey: tenant_id
+      appIdRemoteRefKey: incidentfox/prod/teams_app_id
+      appPasswordRemoteRefKey: incidentfox/prod/teams_app_password
+      tenantIdRemoteRefKey: incidentfox/prod/teams_tenant_id
+    # JWT secret for sandbox credential injection (shared between agent and credential-resolver)
+    jwtSecret:
+      enabled: true
+      secretName: incidentfox-jwt-secret
+      secretKey: JWT_SECRET
+      remoteRefKey: incidentfox/prod/jwt_secret
+    # Shared Anthropic API key for free trials
+    sharedAnthropicKey:
+      enabled: false
+      secretName: incidentfox-shared-anthropic
+      secretKey: ANTHROPIC_API_KEY
+      remoteRefKey: incidentfox/prod/shared_anthropic_api_key
+    # Slack Bot OAuth credentials (for multi-workspace distribution)
+    slackBot:
+      enabled: false
+      secretName: incidentfox-slack-bot
+      clientIdKey: client_id
+      clientSecretKey: client_secret
+      signingSecretKey: signing_secret
+      clientIdRemoteRefKey: incidentfox/prod/slack_client_id
+      clientSecretRemoteRefKey: incidentfox/prod/slack_client_secret
+      signingSecretRemoteRefKey: incidentfox/prod/slack_signing_secret
+  # Vercel integration (deployment webhooks and API access)
+  vercel:
+    enabled: false
+    secretPath: ""
+
+# Vercel webhook signature verification domain
+vercelVerify: ""
+
+services:
+  configService:
+    enabled: true
+    image: "incidentfox/config-service:v1.0.0"
+    replicas: 1
+    servicePort: 8080
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+    readinessProbe:
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 5
+    livenessProbe:
+      enabled: true
+      path: /health
+      initialDelaySeconds: 10
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 5
+    pdb:
+      enabled: true
+      minAvailable: 1
+    hpa:
+      enabled: false
+      minReplicas: 2
+      maxReplicas: 6
+      targetCPUUtilizationPercentage: 70
+    # Auth modes: token|oidc|both
+    adminAuthMode: token
+    teamAuthMode: token
+    # Optional OIDC (for enterprise SSO)
+    oidc:
+      enabled: false
+      issuer: ""
+      audience: ""
+      jwksUrl: ""
+      # Inline JWKS JSON (optional; not recommended for prod). Prefer jwksUrl.
+      jwksJson: ""
+      alg: RS256
+      leewaySeconds: 30
+      groupsClaim: groups
+      adminGroup: incidentfox-config-admin
+      orgIdClaim: org_id
+      teamNodeIdClaim: team_node_id
+      emailClaim: email
+      subjectClaim: sub
+    # Admin RBAC (OIDC group -> permissions). Default keeps backwards-compatible admin:*.
+    adminPermissionsDefault: "admin:*"
+    adminGroupPermissionsJson: "{}"
+  # Agent - SRE investigation agent with sandbox isolation support
+  agent:
+    enabled: true
+    image: "incidentfox/agent:v1.0.0"
+    replicas: 2
+    servicePort: 8000
+    # Command override for the container entrypoint
+    command: ["python", "/app/server.py"]
+    # Additional env vars injected into the agent container
+    extraEnv: []
+    # Time to allow for graceful shutdown (marking in-flight runs as failed)
+    terminationGracePeriodSeconds: 60
+    # Pod-level security context (e.g., runAsNonRoot, runAsUser)
+    podSecurityContext: {}
+    serviceAccount:
+      create: true
+      name: incidentfox-agent
+      annotations: {}
+    # Sandbox mode: creates isolated gVisor pods for each investigation
+    # When disabled, agent runs investigations directly (dev/testing only)
+    sandbox:
+      enabled: false  # Enable for production with gVisor isolation
+      # Image for sandbox pods (defaults to same as agent image)
+      image: ""
+      # Namespace for sandbox pods (defaults to same namespace)
+      namespace: ""
+      # Use gVisor runtime for enhanced isolation
+      useGvisor: true
+    # Warm pool: pre-warmed sandbox pods for instant provisioning (<2s vs ~30-60s)
+    # Requires sandbox.enabled=true and agent-sandbox controller with extensions
+    warmPool:
+      enabled: false
+      # Number of warm pods to maintain (replenished as pods are claimed)
+      replicas: 1
+      # Template name for warm pool pods
+      templateName: incidentfox-warmpool-template
+      # Warm pool name
+      poolName: incidentfox-warmpool
+      # Envoy image for sidecar
+      envoyImage: "envoyproxy/envoy:v1.28.7"
+      # Resource limits for warm pool agent container
+      agentResources:
+        requests:
+          memory: "512Mi"
+          cpu: "100m"
+          ephemeral-storage: "2Gi"
+        limits:
+          memory: "2Gi"
+          cpu: "2000m"
+          ephemeral-storage: "10Gi"
+      # Resource limits for warm pool Envoy sidecar
+      envoyResources:
+        requests:
+          cpu: "50m"
+          memory: "64Mi"
+        limits:
+          cpu: "200m"
+          memory: "128Mi"
+      # CronJob autoscaler: dynamically scales warm pool based on active demand
+      # Polls /metrics/sandbox-demand endpoint and patches warm pool replicas
+      autoscaler:
+        enabled: false
+        minReplicas: 1
+        maxReplicas: 5
+        pollingInterval: 15    # seconds between metric polls
+        cooldownPeriod: 300    # seconds before scaling down after last trigger
+        buffer: 1              # standby pods to maintain above active claims
+    # Agent Observability — LLM tracing for monitoring agent behavior
+    # Backend options: "langfuse", "laminar", "none"
+    # This traces the agent's own LLM calls (token usage, latency, prompts).
+    # NOT the same as tool integrations (Datadog, Grafana, etc.) which the agent
+    # uses to investigate customer incidents.
+    agentObservability:
+      backend: "none"  # "langfuse" | "laminar" | "none"
+      langfuse:
+        host: "https://us.cloud.langfuse.com"
+        secretName: "incidentfox-langfuse"
+        publicKeyKey: "LANGFUSE_PUBLIC_KEY"
+        secretKeyKey: "LANGFUSE_SECRET_KEY"
+      laminar:
+        secretName: "incidentfox-laminar"
+        apiKeyKey: "LMNR_PROJECT_API_KEY"
+    # Legacy tracing config (deprecated — use agentObservability instead)
+    tracing:
+      enabled: false
+      langfuse:
+        enabled: false
+        host: "https://us.cloud.langfuse.com"
+        secretName: "incidentfox-langfuse"
+        publicKeyKey: "LANGFUSE_PUBLIC_KEY"
+        secretKeyKey: "LANGFUSE_SECRET_KEY"
+      otlp:
+        enabled: false
+        endpoint: ""
+    resources:
+      requests:
+        cpu: "200m"
+        memory: "512Mi"
+      limits:
+        cpu: "2000m"
+        memory: "3Gi"
+    # Dedicated health server (separate thread, always responsive)
+    healthServer:
+      port: 8081
+    # Max concurrent sandbox investigations
+    maxConcurrentInvestigations: 8
+    startupProbe:
+      enabled: false
+      path: "/health"
+      initialDelaySeconds: 5
+      periodSeconds: 5
+      timeoutSeconds: 5
+      failureThreshold: 12
+    readinessProbe:
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 3
+    livenessProbe:
+      enabled: true
+      initialDelaySeconds: 20
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 3
+    pdb:
+      enabled: true
+      minAvailable: 1
+    hpa:
+      enabled: false
+      minReplicas: 2
+      maxReplicas: 10
+      targetCPUUtilizationPercentage: 70
+    # Static team token (dev/single-tenant mode only)
+    staticTeamToken:
+      enabled: false
+      secretName: incidentfox-team-token
+      secretKey: token
+    # Cleanup cronjob for stale agent runs
+    cleanup:
+      enabled: true
+      schedule: "*/5 * * * *"  # Every 5 minutes
+      maxAgeSeconds: 600       # Mark runs as timeout if running > 10 minutes
+  orchestrator:
+    enabled: true
+    image: "incidentfox/orchestrator:v1.0.0"
+    replicas: 2
+    servicePort: 8070
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+    livenessProbe:
+      enabled: true
+      path: /health
+      initialDelaySeconds: 10
+      periodSeconds: 10
+    pdb:
+      enabled: true
+      minAvailable: 1
+    hpa:
+      enabled: false
+      minReplicas: 2
+      maxReplicas: 6
+      targetCPUUtilizationPercentage: 70
+    # Small in-memory cache to reduce config_service /auth/me pressure.
+    adminAuthCacheTtlSeconds: 15
+    # If true, require `admin:*` in principal permissions (in addition to any endpoint-scoped permissions).
+    requireAdminStar: true
+    requiredPermissions:
+      provisionTeam: admin:provision
+      provisionRead: admin:provision:read
+      agentRun: admin:agent:run
+    # Slack-triggered agent runs (enterprise defaults)
+    slack:
+      agentMaxTurns: 50         # Max tool calls per run (enterprise: 30-100)
+      agentTimeoutSeconds: 180  # 3 minutes (enterprise: 2-5 min)
+
+  # Slack Bot - Multi-tenant Slack integration
+  slackBot:
+    enabled: false
+    image: "incidentfox/slack-bot:v1.0.0"
+    replicas: 1
+    servicePort: 3000
+    serviceAccount:
+      create: true
+      name: slack-bot
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+    readinessProbe:
+      initialDelaySeconds: 5
+      periodSeconds: 10
+    livenessProbe:
+      enabled: true
+      initialDelaySeconds: 10
+      periodSeconds: 30
+    # Free trial configuration
+    freeTrial:
+      enabled: true
+      days: 7
+    # Service configuration
+    service:
+      type: ClusterIP  # Use LoadBalancer for direct NLB exposure, or ClusterIP for Ingress
+      # Annotations for NLB with HTTPS termination (when type: LoadBalancer)
+      annotations: {}
+        # service.beta.kubernetes.io/aws-load-balancer-scheme: "internet-facing"
+        # service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+        # service.beta.kubernetes.io/aws-load-balancer-ssl-cert: "arn:aws:acm:..."
+        # service.beta.kubernetes.io/aws-load-balancer-ssl-ports: "443"
+        # service.beta.kubernetes.io/aws-load-balancer-backend-protocol: "http"
+
+  aiPipelineApi:
+    enabled: false  # Deprecated - use knowledgeBase instead
+    image: "incidentfox/knowledge-base:v1.0.0"
+    replicas: 2
+    servicePort: 8090
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "512Mi"
+      limits:
+        cpu: "1000m"
+        memory: "2Gi"
+    livenessProbe:
+      enabled: true
+      path: /health
+      initialDelaySeconds: 20
+      periodSeconds: 10
+    pdb:
+      enabled: true
+      minAvailable: 1
+    hpa:
+      enabled: false
+      minReplicas: 2
+      maxReplicas: 6
+      targetCPUUtilizationPercentage: 70
+
+  # RAPTOR Knowledge Base - semantic search and Q&A for observability documentation
+  knowledgeBase:
+    enabled: false  # Enable when memory-intensive nodegroup is available
+    image: "incidentfox/knowledge-base:v1.0.0"
+    replicas: 1
+    servicePort: 8000
+    # IRSA role ARN for S3 access (created via Terraform)
+    serviceAccountRoleArn: ""
+    # Default tree to load at startup
+    defaultTree: "mega_ultra_v2"
+    # Volume size for tree storage
+    treesVolumeSizeLimit: "3Gi"
+    # S3 configuration for tree download
+    s3:
+      enabled: false
+      bucket: ""  # e.g., "raptor-kb-trees-123456789012"
+      prefix: "trees/"
+      awsCliImage: "amazon/aws-cli:2.15.0"
+    # Schedule on memory-intensive nodes (t3.xlarge with 16GB RAM)
+    nodeSelector:
+      workload: memory-intensive
+    # Tolerate disk-pressure during initial tree download
+    tolerations:
+      - key: "node.kubernetes.io/disk-pressure"
+        operator: "Exists"
+        effect: "NoSchedule"
+    # High memory requirements for RAPTOR tree loading
+    resources:
+      requests:
+        cpu: "250m"
+        memory: "8Gi"
+      limits:
+        cpu: "2"
+        memory: "12Gi"
+    # Startup probe allows long startup time (S3 download + model load)
+    # 30s initial + 30 failures * 10s = up to 5 min 30s startup time
+    startupProbe:
+      initialDelaySeconds: 30
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 30
+    # After startup probe passes, shorter delays for normal operation
+    readinessProbe:
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      timeoutSeconds: 5
+    livenessProbe:
+      enabled: true
+      path: /health
+      initialDelaySeconds: 10
+      periodSeconds: 30
+      timeoutSeconds: 10
+    pdb:
+      enabled: false  # Single replica, PDB not useful
+      minAvailable: 1
+
+  # NOTE: Self-Learning CronJobs are created dynamically by the Orchestrator
+  # during team provisioning. See orchestrator/src/.../k8s/cronjobs.py
+
+  # Ultimate RAG - Advanced knowledge base with graph queries, teaching, and analytics
+  # This is the next-generation replacement for knowledgeBase
+  ultimateRag:
+    enabled: false  # Enable when ready to migrate from knowledgeBase
+    image: "incidentfox/ultimate-rag:v1.0.0"
+    replicas: 1
+    servicePort: 8000
+    # IRSA role ARN for S3 access (same as knowledgeBase)
+    serviceAccountRoleArn: ""
+    # Default tree to load at startup
+    defaultTree: "mega_ultra_v2"
+    # Volume size for tree storage
+    treesVolumeSizeLimit: "3Gi"
+    # S3 configuration for tree download
+    s3:
+      enabled: false
+      bucket: ""  # e.g., "raptor-kb-trees-123456789012"
+      prefix: "trees/"
+      awsCliImage: "amazon/aws-cli:2.15.0"
+    # Schedule on memory-intensive nodes
+    nodeSelector:
+      workload: memory-intensive
+    # Tolerate disk-pressure during initial tree download
+    tolerations:
+      - key: "node.kubernetes.io/disk-pressure"
+        operator: "Exists"
+        effect: "NoSchedule"
+    # High memory requirements for tree loading
+    resources:
+      requests:
+        cpu: "250m"
+        memory: "8Gi"
+      limits:
+        cpu: "2"
+        memory: "12Gi"
+    # Startup probe allows long startup time (S3 download + model load)
+    # 30s initial + 30 failures * 10s = up to 5 min 30s startup time
+    startupProbe:
+      initialDelaySeconds: 30
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 30
+    # After startup probe passes, shorter delays for normal operation
+    readinessProbe:
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      timeoutSeconds: 5
+    livenessProbe:
+      enabled: true
+      path: /health
+      initialDelaySeconds: 10
+      periodSeconds: 30
+      timeoutSeconds: 10
+    pdb:
+      enabled: false
+      minAvailable: 1
+
+  webUi:
+    enabled: true
+    image: "incidentfox/web-ui:v1.0.0"
+    replicas: 2
+    servicePort: 3000
+    # RAPTOR Knowledge Base API URL (for tree explorer, semantic search, Q&A)
+    # Use the alias service which auto-routes to whichever RAG is enabled:
+    # raptorApiUrl: "http://incidentfox-rag.incidentfox.svc.cluster.local:8000"
+    #
+    # Or point directly to a specific implementation:
+    # raptorApiUrl: "http://incidentfox-knowledge-base.incidentfox.svc.cluster.local:8000"
+    # raptorApiUrl: "http://incidentfox-ultimate-rag.incidentfox.svc.cluster.local:8000"
+    raptorApiUrl: ""
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "1Gi"
+    livenessProbe:
+      enabled: true
+      path: /
+      initialDelaySeconds: 10
+      periodSeconds: 10
+    pdb:
+      enabled: true
+      minAvailable: 1
+    hpa:
+      enabled: false
+      minReplicas: 2
+      maxReplicas: 6
+      targetCPUUtilizationPercentage: 70
+    cookieSecure: false
+    oidc:
+      enabled: false
+    slack:
+      enabled: false
+      publicBaseUrl: "" # e.g. https://incidentfox.company.com
+      authorizationEndpoint: ""
+      tokenEndpoint: ""
+      clientId: ""
+      scopes: "openid email profile groups"
+      # Prefer injecting client secret via External Secrets Operator into a K8s Secret:
+      clientSecret:
+        secretName: "" # e.g. incidentfox-web-ui-oidc
+        secretKey: "client_secret"
+        # Optional: (not recommended) set a raw value directly in values.
+        value: ""
+  # K8s Gateway - Accepts connections from customer K8s agents (SaaS mode)
+  # Enables customers to connect their private K8s clusters without firewall changes.
+  # Agents connect outbound via SSE; gateway routes commands from AI agent.
+  k8sGateway:
+    enabled: false  # Enable for SaaS deployments
+    image: "incidentfox/k8s-gateway:v1.0.0"
+    replicas: 2
+    servicePort: 8085
+    logLevel: "INFO"
+    # Heartbeat interval for agent connections (seconds)
+    heartbeatIntervalSeconds: 30
+    # Timeout for command execution (seconds)
+    commandTimeoutSeconds: 30
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+    livenessProbe:
+      enabled: true
+      path: /health
+      initialDelaySeconds: 10
+      periodSeconds: 30
+    readinessProbe:
+      initialDelaySeconds: 5
+      periodSeconds: 10
+    pdb:
+      enabled: true
+      minAvailable: 1
+    hpa:
+      enabled: false
+      minReplicas: 2
+      maxReplicas: 6
+      targetCPUUtilizationPercentage: 70
+
+  # Sandbox Router - Routes requests to dynamically created sandbox pods
+  # Provides stable endpoints while sandbox pods are created/destroyed.
+  sandboxRouter:
+    enabled: false  # Enable when using gVisor sandboxes
+    image: "incidentfox/sandbox-router:v1.0.0"
+    replicas: 2
+    servicePort: 8080
+    resources:
+      requests:
+        cpu: "250m"
+        memory: "512Mi"
+      limits:
+        cpu: "1000m"
+        memory: "1Gi"
+    readinessProbe:
+      initialDelaySeconds: 5
+      periodSeconds: 5
+      timeoutSeconds: 3
+      failureThreshold: 3
+    livenessProbe:
+      initialDelaySeconds: 10
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 3
+    hpa:
+      enabled: false
+      minReplicas: 2
+      maxReplicas: 10
+      targetCPUUtilizationPercentage: 70
+
+  # Sandbox Cleanup - CronJob that removes expired sandbox pods
+  # Runs periodically to garbage collect sandboxes past their TTL.
+  sandboxCleanup:
+    enabled: false  # Enable when using gVisor sandboxes
+    image: "bitnami/kubectl:latest"
+    schedule: "*/15 * * * *"  # Every 15 minutes
+    successfulJobsHistoryLimit: 3
+    failedJobsHistoryLimit: 3
+    ttlSecondsAfterFinished: 3600
+    resources:
+      requests:
+        cpu: "50m"
+        memory: "64Mi"
+      limits:
+        cpu: "200m"
+        memory: "128Mi"
+
+  # Credential Resolver - JWT-secured credential injection for sandbox pods
+  # This service validates sandbox JWTs and injects credentials via Envoy ext_authz.
+  # Sandboxes cannot access credentials directly - enhances security.
+  credentialResolver:
+    enabled: false  # Enable when using gVisor sandboxes with credential injection
+    image: "incidentfox/credential-resolver:v1.0.0"
+    replicas: 2
+    servicePort: 8002
+    # Credential source: config_service (multi-tenant SaaS) or environment (dev)
+    credentialSource: config_service
+    # JWT validation mode: strict (require valid JWT) or permissive (dev only)
+    jwtMode: strict
+    serviceAccount:
+      name: credential-resolver
+      annotations: {}
+    # Shared Anthropic API key for free trials (fallback when team has no BYOK)
+    sharedAnthropicKey:
+      enabled: false
+      secretName: incidentfox-shared-anthropic
+      secretKey: ANTHROPIC_API_KEY
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "128Mi"
+      limits:
+        cpu: "500m"
+        memory: "256Mi"
+    livenessProbe:
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 3
+    readinessProbe:
+      initialDelaySeconds: 5
+      periodSeconds: 5
+      timeoutSeconds: 5
+      failureThreshold: 3
+    pdb:
+      enabled: true
+      minAvailable: 1
+
+# Karpenter — dynamic node provisioning for burst workloads (production only)
+# Requires: Terraform karpenter_enabled=true + Karpenter Helm chart installed
+karpenter:
+  enabled: false
+  clusterName: ""
+  nodeRoleName: ""
+  capacityTypes: ["on-demand"]
+  limits:
+    cpu: "16"
+    memory: "64Gi"
+  consolidateAfter: "5m"
+  rootVolumeSize: "40Gi"

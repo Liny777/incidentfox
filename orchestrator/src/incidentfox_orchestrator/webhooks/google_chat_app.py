@@ -1,0 +1,737 @@
+"""
+Google Chat App for multi-tenant webhook handling.
+
+Handles Google Chat events:
+- MESSAGE: User sends a message mentioning the bot
+- ADDED_TO_SPACE: Bot added to a space
+- REMOVED_FROM_SPACE: Bot removed
+- CARD_CLICKED: User clicks an interactive card button
+
+Multi-tenant routing via google_chat_space_id in ConfigService.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import uuid
+from functools import partial
+from typing import TYPE_CHECKING, Any, Dict, Optional
+
+import httpx
+
+if TYPE_CHECKING:
+    from incidentfox_orchestrator.clients import (
+        AgentApiClient,
+        AuditApiClient,
+        ConfigServiceClient,
+    )
+
+
+def _log(event: str, **fields: Any) -> None:
+    """Structured logging."""
+    try:
+        payload = {
+            "service": "orchestrator",
+            "component": "google_chat",
+            "event": event,
+            **fields,
+        }
+        print(json.dumps(payload, default=str))
+    except Exception:
+        print(f"{event} {fields}")
+
+
+def generate_session_id(space_id: str, thread_key: str) -> str:
+    """
+    Generate session ID for thread-based conversational context.
+
+    Uses space + thread key for stable ID across follow-up messages.
+    Sanitized for use as K8s resource names (RFC 1123: lowercase alphanumeric
+    and hyphens only, max 63 chars for labels).
+
+    Example:
+        space_id="ABC123", thread_key="spaces/ABC123/threads/xyz"
+        -> "gchat-abc123-xyz"
+    """
+    import re
+
+    def _sanitize(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+
+    # Extract thread ID from full thread name
+    thread_id = thread_key.split("/")[-1] if thread_key else "main"
+    sanitized_space = _sanitize(space_id)[:20]
+    sanitized_thread = _sanitize(thread_id)[:30]
+    # "gchat-" (6) + space (≤20) + "-" (1) + thread (≤30) = ≤57, under 63
+    return f"gchat-{sanitized_space}-{sanitized_thread}"
+
+
+WELCOME_MESSAGE = (
+    "*Welcome to IncidentFox!*\n\n"
+    "IncidentFox is an AI-powered incident investigation assistant "
+    "for Google Chat\u2122.\n\n"
+    "Get started by mentioning me with a question or issue:\n"
+    "- `@IncidentFox investigate high error rate on checkout service`\n"
+    "- `@IncidentFox why is pod X crashing in namespace Y?`\n"
+    "- `@IncidentFox help` \u2014 see all available commands\n\n"
+    "I\u2019ll analyze logs, metrics, and infrastructure to help you "
+    "triage incidents faster."
+)
+
+HELP_MESSAGE = (
+    "*IncidentFox Help*\n\n"
+    "I\u2019m an AI-powered incident investigation assistant. "
+    "Mention me with a description of the issue and I\u2019ll investigate.\n\n"
+    "*Example prompts:*\n"
+    "- `@IncidentFox investigate high latency on the payments service`\n"
+    "- `@IncidentFox why are pods restarting in the production namespace?`\n"
+    "- `@IncidentFox check the error logs for the auth service`\n"
+    "- `@IncidentFox triage this alert: <paste alert details>`\n"
+    "- `@IncidentFox help` \u2014 show this help message\n\n"
+    "I can access your team\u2019s Kubernetes clusters, logs, metrics, and more "
+    "to help you find the root cause faster."
+)
+
+
+class GoogleChatIntegration:
+    """
+    Manages Google Chat integration lifecycle.
+
+    Similar to SlackBoltIntegration but for Google Chat.
+    """
+
+    def __init__(
+        self,
+        config_service: ConfigServiceClient,
+        agent_api: AgentApiClient,
+        audit_api: AuditApiClient | None,
+        google_chat_project_id: str,
+    ):
+        self.config_service = config_service
+        self.agent_api = agent_api
+        self.audit_api = audit_api
+        self.project_id = google_chat_project_id
+
+    async def handle_event(
+        self,
+        event_type: str,
+        event_data: Dict[str, Any],
+        correlation_id: str,
+    ) -> Dict[str, Any]:
+        """
+        Handle incoming Google Chat event.
+
+        Returns: Response to send back to Google Chat (sync response)
+        """
+        if event_type == "MESSAGE":
+            return await self._handle_message(event_data, correlation_id)
+        elif event_type == "ADDED_TO_SPACE":
+            return await self._handle_added_to_space(event_data, correlation_id)
+        elif event_type == "REMOVED_FROM_SPACE":
+            return self._handle_removed_from_space(event_data, correlation_id)
+        elif event_type == "CARD_CLICKED":
+            return await self._handle_card_clicked(event_data, correlation_id)
+        else:
+            _log(
+                "gchat_unknown_event",
+                event_type=event_type,
+                correlation_id=correlation_id,
+            )
+            return {}
+
+    async def _handle_message(
+        self,
+        event_data: Dict[str, Any],
+        correlation_id: str,
+    ) -> Dict[str, Any]:
+        """
+        Handle MESSAGE event (user mentions bot or DMs bot).
+
+        Flow mirrors slack_handlers.py:
+        1. Extract space_id, thread_key, message text
+        2. Generate session ID for thread context
+        3. Look up team via Config Service routing (google_chat_space_id)
+        4. Get impersonation token
+        5. Resolve output destinations
+        6. Call agent API (in background task)
+        7. Return immediate "working on it" response
+        """
+        space = event_data.get("space", {})
+        space_name = space.get("name", "")  # Format: "spaces/XXXXX"
+        space_id = space_name.split("/")[-1] if space_name else ""
+
+        message = event_data.get("message", {})
+        # argumentText has the message with @mention removed
+        text = message.get("argumentText", "") or message.get("text", "")
+        text = text.strip()
+
+        thread = message.get("thread", {})
+        thread_key = thread.get("name", "")  # Format: "spaces/XXX/threads/YYY"
+
+        message_name = message.get("name", "")
+
+        user = event_data.get("user", {})
+        user_id = user.get("name", "")  # Format: "users/XXXXX"
+        user_display_name = user.get("displayName", "")
+
+        session_id = generate_session_id(space_id, thread_key or message_name)
+
+        _log(
+            "gchat_message_processing",
+            correlation_id=correlation_id,
+            space_id=space_id,
+            user_id=user_id,
+            session_id=session_id,
+            text_length=len(text),
+        )
+
+        # Static help response — no LLM call
+        if text.lower() == "help":
+            _log(
+                "gchat_help_requested",
+                correlation_id=correlation_id,
+                space_id=space_id,
+            )
+            return {"text": HELP_MESSAGE}
+
+        if not text:
+            return {
+                "text": "Hey! What would you like me to investigate?",
+                "thread": {"name": thread_key} if thread_key else None,
+            }
+
+        # Fire off background processing
+        asyncio.create_task(
+            self._process_message_async(
+                space_id=space_id,
+                space_name=space_name,
+                thread_key=thread_key,
+                text=text,
+                user_id=user_id,
+                user_display_name=user_display_name,
+                session_id=session_id,
+                correlation_id=correlation_id,
+            )
+        )
+
+        # Return empty — sync createMessageAction can't reply in threads.
+        # The async handler sends a "working on it" + result via REST API.
+        return {}
+
+    async def _process_message_async(
+        self,
+        space_id: str,
+        space_name: str,
+        thread_key: str,
+        text: str,
+        user_id: str,
+        user_display_name: str,
+        session_id: str,
+        correlation_id: str,
+    ) -> None:
+        """Process message asynchronously (mirrors slack_handlers pattern)."""
+        try:
+            cfg = self.config_service
+            agent_api = self.agent_api
+
+            # Look up team via routing
+            routing = await asyncio.to_thread(
+                cfg.lookup_routing,
+                internal_service_name="orchestrator",
+                identifiers={"google_chat_space_id": space_id},
+            )
+
+            if not routing.get("found"):
+                _log(
+                    "gchat_no_routing_attempting_provision",
+                    correlation_id=correlation_id,
+                    space_id=space_id,
+                    tried=routing.get("tried", []),
+                )
+                provision = await self._auto_provision(
+                    space_id=space_id,
+                    correlation_id=correlation_id,
+                )
+                if not provision:
+                    try:
+                        await self._send_message_to_space(
+                            space_name=space_name,
+                            text=(
+                                "Sorry, I couldn't set up IncidentFox automatically. "
+                                "Please contact your administrator to configure the integration."
+                            ),
+                            thread_key="",
+                            effective_config={},
+                            correlation_id=correlation_id,
+                        )
+                    except Exception:
+                        pass
+                    return
+                org_id = provision["org_id"]
+                team_node_id = provision["team_node_id"]
+            else:
+                org_id = routing["org_id"]
+                team_node_id = routing["team_node_id"]
+
+            _log(
+                "gchat_routing_found",
+                correlation_id=correlation_id,
+                space_id=space_id,
+                org_id=org_id,
+                team_node_id=team_node_id,
+                matched_by=routing.get("matched_by"),
+            )
+
+            # Get impersonation token
+            admin_token = (os.getenv("ORCHESTRATOR_INTERNAL_ADMIN_TOKEN") or "").strip()
+            if not admin_token:
+                _log("gchat_missing_admin_token", correlation_id=correlation_id)
+                return
+
+            imp = await asyncio.to_thread(
+                cfg.issue_team_impersonation_token,
+                admin_token,
+                org_id=org_id,
+                team_node_id=team_node_id,
+            )
+            team_token = str(imp.get("token") or "")
+            if not team_token:
+                _log("gchat_impersonation_failed", correlation_id=correlation_id)
+                return
+
+            # Get effective config
+            entrance_agent_name = "planner"
+            dedicated_agent_url: Optional[str] = None
+            effective_config: Dict[str, Any] = {}
+            try:
+                effective_config = await asyncio.to_thread(
+                    cfg.get_effective_config, team_token=team_token
+                )
+                entrance_agent_name = effective_config.get("entrance_agent", "planner")
+                dedicated_agent_url = effective_config.get("agent", {}).get(
+                    "dedicated_service_url"
+                )
+                if dedicated_agent_url:
+                    _log(
+                        "gchat_using_dedicated_agent",
+                        correlation_id=correlation_id,
+                        dedicated_url=dedicated_agent_url,
+                    )
+            except Exception as e:
+                _log(
+                    "gchat_config_fetch_failed",
+                    correlation_id=correlation_id,
+                    error=str(e),
+                )
+
+            # Send "working on it" in the thread via REST API
+            await self._send_message_to_space(
+                space_name=space_name,
+                text="IncidentFox is working on it...",
+                thread_key=thread_key,
+                effective_config=effective_config,
+                correlation_id=correlation_id,
+            )
+
+            run_id = uuid.uuid4().hex
+
+            # Resolve output destinations
+            from incidentfox_orchestrator.output_resolver import (
+                resolve_output_destinations,
+            )
+
+            trigger_payload = {
+                "space_id": space_id,
+                "space_name": space_name,
+                "thread_key": thread_key,
+                "user_id": user_id,
+                "user_display_name": user_display_name,
+            }
+
+            output_destinations = resolve_output_destinations(
+                trigger_source="google_chat",
+                trigger_payload=trigger_payload,
+                team_config=effective_config,
+            )
+
+            # Add run_id and correlation_id to Google Chat destinations
+            for dest in output_destinations:
+                if dest.get("type") == "google_chat":
+                    dest["run_id"] = run_id
+                    dest["correlation_id"] = correlation_id
+
+            _log(
+                "gchat_output_destinations",
+                correlation_id=correlation_id,
+                destinations=[d.get("type") for d in output_destinations],
+            )
+
+            # Run agent in thread pool — calls /investigate and streams SSE
+            # asyncio.wait_for is a safety net: even if the httpx/requests read
+            # timeout inside run_agent doesn't fire (e.g. proxy keepalives), we
+            # still bound the total wall-clock time.
+            agent_timeout = int(
+                os.getenv("ORCHESTRATOR_GCHAT_AGENT_TIMEOUT_SECONDS", "300")
+            )
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    partial(
+                        agent_api.run_agent,
+                        team_token=team_token,
+                        agent_name=entrance_agent_name,
+                        message=text,
+                        tenant_id=org_id,
+                        team_id=team_node_id,
+                        timeout=agent_timeout,
+                        correlation_id=correlation_id,
+                        agent_base_url=dedicated_agent_url,
+                        session_id=session_id,
+                    )
+                ),
+                timeout=agent_timeout + 60,  # 60s grace beyond agent timeout
+            )
+
+            # Send result back to Google Chat space
+            result_text = result.get("result", "")
+            if result_text:
+                await self._send_message_to_space(
+                    space_name=space_name,
+                    text=result_text,
+                    thread_key=thread_key,
+                    effective_config=effective_config,
+                    correlation_id=correlation_id,
+                )
+
+            _log(
+                "gchat_message_completed",
+                correlation_id=correlation_id,
+                space_id=space_id,
+                org_id=org_id,
+                team_node_id=team_node_id,
+                session_id=session_id,
+            )
+
+        except Exception as e:
+            _log(
+                "gchat_message_failed",
+                correlation_id=correlation_id,
+                space_id=space_id,
+                error=str(e),
+            )
+            # Send error feedback to user so they don't stare at "working on it" forever
+            try:
+                await self._send_message_to_space(
+                    space_name=space_name,
+                    text=(
+                        "Sorry, the investigation timed out or encountered an error. "
+                        "Please try again."
+                    ),
+                    thread_key=thread_key,
+                    effective_config=effective_config,
+                    correlation_id=correlation_id,
+                )
+            except Exception:
+                pass  # Best-effort error feedback
+
+    async def _send_message_to_space(
+        self,
+        space_name: str,
+        text: str,
+        thread_key: str,
+        effective_config: Dict[str, Any],
+        correlation_id: str,
+    ) -> None:
+        """
+        Send a message to a Google Chat space via REST API.
+
+        Uses service account credentials from team config or environment
+        to authenticate with the Google Chat API.
+        """
+        try:
+            # Get service account credentials
+            sa_key_json = (
+                (effective_config or {})
+                .get("integrations", {})
+                .get("google_chat", {})
+                .get("service_account_key")
+            ) or os.getenv("GOOGLE_CHAT_SERVICE_ACCOUNT_KEY", "")
+
+            if not sa_key_json:
+                _log(
+                    "gchat_send_no_credentials",
+                    correlation_id=correlation_id,
+                    space_name=space_name,
+                )
+                return
+
+            # Parse key — may be raw JSON, base64-encoded JSON, or a dict
+            if isinstance(sa_key_json, str):
+                try:
+                    sa_key_info = json.loads(sa_key_json)
+                except json.JSONDecodeError:
+                    # Try base64 decode
+                    import base64
+
+                    sa_key_info = json.loads(base64.b64decode(sa_key_json))
+            else:
+                sa_key_info = sa_key_json
+
+            # Build access token from service account
+            from google.oauth2 import service_account
+
+            credentials = service_account.Credentials.from_service_account_info(
+                sa_key_info,
+                scopes=["https://www.googleapis.com/auth/chat.bot"],
+            )
+            # Refresh to get access token
+            from google.auth.transport import requests as google_requests
+
+            credentials.refresh(google_requests.Request())
+            access_token = credentials.token
+
+            # Build message payload
+            url = f"https://chat.googleapis.com/v1/{space_name}/messages"
+            payload: Dict[str, Any] = {"text": text}
+            if thread_key:
+                payload["thread"] = {"name": thread_key}
+
+            params = {}
+            if thread_key:
+                params["messageReplyOption"] = "REPLY_MESSAGE_FALLBACK_TO_NEW_THREAD"
+
+            # Send message
+            resp = await asyncio.to_thread(
+                self._post_gchat_message,
+                url=url,
+                access_token=access_token,
+                payload=payload,
+                params=params,
+            )
+
+            _log(
+                "gchat_message_sent",
+                correlation_id=correlation_id,
+                space_name=space_name,
+                result_length=len(text),
+                status_code=resp,
+            )
+
+        except Exception as e:
+            _log(
+                "gchat_send_failed",
+                correlation_id=correlation_id,
+                space_name=space_name,
+                error=str(e),
+            )
+
+    @staticmethod
+    def _post_gchat_message(
+        url: str,
+        access_token: str,
+        payload: Dict[str, Any],
+        params: Dict[str, str],
+    ) -> int:
+        """Sync helper to POST a message to Google Chat API. Returns status code."""
+        with httpx.Client(timeout=15.0) as c:
+            r = c.post(
+                url,
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                params=params,
+            )
+            r.raise_for_status()
+            return r.status_code
+
+    async def _auto_provision(
+        self,
+        space_id: str,
+        correlation_id: str,
+    ) -> Optional[Dict[str, str]]:
+        """Auto-provision an org + team for a new Google Chat space.
+
+        Creates the org and default team in config-service, then registers
+        the routing identifier so subsequent messages are routed correctly.
+
+        Returns ``{"org_id": ..., "team_node_id": ...}`` on success, or None.
+        """
+        try:
+            admin_token = (os.getenv("ORCHESTRATOR_INTERNAL_ADMIN_TOKEN") or "").strip()
+            if not admin_token:
+                _log(
+                    "gchat_auto_provision_no_admin_token", correlation_id=correlation_id
+                )
+                return None
+
+            cfg = self.config_service
+
+            org_id = f"gchat-{space_id}"
+            org_name = f"Google Chat {space_id[:16]}"
+            team_node_id = "default"
+
+            # Step 1: Create org (idempotent)
+            await asyncio.to_thread(cfg.create_org_node, admin_token, org_id, org_name)
+
+            # Step 2: Create default team (idempotent)
+            await asyncio.to_thread(
+                cfg.create_team_node, admin_token, org_id, team_node_id, "Default Team"
+            )
+
+            # Step 3: Update routing to include this space ID.
+            existing_ids: list[str] = []
+            try:
+                eff = await asyncio.to_thread(
+                    cfg.get_effective_config_for_node,
+                    admin_token,
+                    org_id,
+                    team_node_id,
+                )
+                existing_ids = list(
+                    eff.get("routing", {}).get("google_chat_space_ids", [])
+                )
+            except Exception:
+                pass
+
+            if space_id not in existing_ids:
+                existing_ids.append(space_id)
+
+            await asyncio.to_thread(
+                cfg.patch_node_config,
+                admin_token,
+                org_id,
+                team_node_id,
+                {
+                    "routing": {"google_chat_space_ids": existing_ids},
+                    "integrations": {
+                        "anthropic": {
+                            "is_trial": True,
+                            "trial_expires_at": "2030-12-31T23:59:59.000000",
+                            "subscription_status": "active",
+                        },
+                    },
+                },
+            )
+
+            _log(
+                "gchat_auto_provision_success",
+                correlation_id=correlation_id,
+                org_id=org_id,
+                team_node_id=team_node_id,
+                space_id=space_id,
+            )
+            return {"org_id": org_id, "team_node_id": team_node_id}
+
+        except Exception as e:
+            _log(
+                "gchat_auto_provision_failed",
+                correlation_id=correlation_id,
+                error=str(e),
+            )
+            return None
+
+    async def _handle_added_to_space(
+        self,
+        event_data: Dict[str, Any],
+        correlation_id: str,
+    ) -> Dict[str, Any]:
+        """Handle ADDED_TO_SPACE event (bot added to a space)."""
+        space = event_data.get("space", {})
+        space_name = space.get("name", "")
+        space_type = space.get("type", "")  # ROOM, DM, etc.
+        space_id = space_name.split("/")[-1] if space_name else ""
+
+        user = event_data.get("user", {})
+        user_display_name = user.get("displayName", "")
+
+        _log(
+            "gchat_added_to_space",
+            correlation_id=correlation_id,
+            space_name=space_name,
+            space_type=space_type,
+            added_by=user_display_name,
+        )
+
+        # Proactively provision so first message routes correctly
+        if space_id:
+            asyncio.create_task(
+                self._auto_provision(
+                    space_id=space_id,
+                    correlation_id=correlation_id,
+                )
+            )
+
+        return {"text": WELCOME_MESSAGE}
+
+    def _handle_removed_from_space(
+        self,
+        event_data: Dict[str, Any],
+        correlation_id: str,
+    ) -> Dict[str, Any]:
+        """Handle REMOVED_FROM_SPACE event (bot removed from a space)."""
+        space = event_data.get("space", {})
+        space_name = space.get("name", "")
+
+        _log(
+            "gchat_removed_from_space",
+            correlation_id=correlation_id,
+            space_name=space_name,
+        )
+
+        # No response needed when removed
+        return {}
+
+    async def _handle_card_clicked(
+        self,
+        event_data: Dict[str, Any],
+        correlation_id: str,
+    ) -> Dict[str, Any]:
+        """
+        Handle CARD_CLICKED event (user clicks an interactive card button).
+
+        Used for feedback buttons similar to Slack.
+        """
+        action = event_data.get("action", {})
+        action_method_name = action.get("actionMethodName", "")
+        action_parameters = action.get("parameters", [])
+
+        # Convert parameters list to dict
+        params = {p.get("key"): p.get("value") for p in action_parameters}
+        run_id = params.get("run_id")
+        feedback_type = params.get("feedback_type")
+
+        user = event_data.get("user", {})
+        user_id = user.get("name", "")
+
+        _log(
+            "gchat_card_clicked",
+            correlation_id=correlation_id,
+            action_method_name=action_method_name,
+            run_id=run_id,
+            feedback_type=feedback_type,
+            user_id=user_id,
+        )
+
+        # Handle feedback actions
+        if action_method_name == "submit_feedback" and feedback_type and run_id:
+            if self.audit_api:
+                await asyncio.to_thread(
+                    self.audit_api.record_feedback,
+                    run_id=run_id,
+                    correlation_id=correlation_id,
+                    feedback=feedback_type,
+                    user_id=user_id,
+                    source="google_chat",
+                )
+
+            return {
+                "actionResponse": {
+                    "type": "UPDATE_MESSAGE",
+                },
+                "text": "Thanks for your feedback!",
+            }
+
+        return {}
