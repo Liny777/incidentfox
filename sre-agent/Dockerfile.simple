@@ -1,26 +1,30 @@
 FROM python:3.11-slim
 
-# Install Node.js (required by Claude Code CLI)
-RUN apt-get update && \
-    apt-get install -y curl gnupg && \
+# Debian apt 走华为镜像(避免 deb.debian.org DNS 抖动)
+# Node.js 走 nodesource 官方(deb.nodesource.com 实测可达)
+RUN sed -i 's|http://deb.debian.org|https://mirrors.huaweicloud.com|g; s|http://security.debian.org|https://mirrors.huaweicloud.com|g' /etc/apt/sources.list.d/debian.sources && \
+    apt-get update && \
+    apt-get install -y curl gnupg ca-certificates && \
     curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
     apt-get install -y nodejs && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# Install Claude Code CLI
-RUN npm install -g @anthropic-ai/claude-code
+# Install Claude Code CLI (Huawei npm mirror)
+RUN npm config set registry https://mirrors.huaweicloud.com/repository/npm/ && \
+    npm install -g @anthropic-ai/claude-code
 
 WORKDIR /app
 
-# Install uv for fast package management
-RUN pip install --no-cache-dir uv
+# Install uv (use Tsinghua PyPI mirror — Huawei mirror is rate-limited)
+RUN pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple && \
+    pip install --no-cache-dir uv
 
 # Copy dependency files
 COPY pyproject.toml .
 
-# Install dependencies
-RUN uv pip install --system -e .
+# Install dependencies via uv with Tsinghua mirror
+RUN uv pip install --system -e . --index-url https://pypi.tuna.tsinghua.edu.cn/simple
 
 # Copy application code
 COPY agent.py config.py events.py server_simple.py ./

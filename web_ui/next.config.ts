@@ -4,6 +4,11 @@ import type { NextConfig } from "next";
 const nextConfig: NextConfig = {
   // Needed for small, production-ready Docker images (see Dockerfile).
   output: "standalone",
+  // Deploy under company gateway path: https://console.../incident/web-ui
+  // All static assets and routes will be prefixed automatically.
+  // To deploy at root path again, set NEXT_PUBLIC_BASE_PATH="" or remove the line.
+  basePath: process.env.NEXT_PUBLIC_BASE_PATH || "/incident/web-ui",
+  assetPrefix: process.env.NEXT_PUBLIC_BASE_PATH || "/incident/web-ui",
   async headers() {
     return [
       {

@@ -7,15 +7,17 @@ WORKDIR /app
 
 RUN useradd -m -u 1000 appuser
 
-# Install Node.js (required for MCP preview functionality)
-RUN apt-get update && apt-get upgrade -y && \
-    apt-get install -y --no-install-recommends curl && \
-    curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
-    apt-get install -y nodejs && \
+# Skip Node.js install — only needed for MCP preview, which we don't use.
+# (Original code tried to install nodejs from NodeSource; removed for simpler, offline-friendly build.)
+RUN sed -i 's|http://deb.debian.org|https://mirrors.huaweicloud.com|g; s|http://security.debian.org|https://mirrors.huaweicloud.com|g' /etc/apt/sources.list.d/debian.sources && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
 COPY requirements.runtime.txt /app/requirements.runtime.txt
-RUN pip install --no-cache-dir -r /app/requirements.runtime.txt \
+# Use Tsinghua PyPI mirror to avoid timeouts on default PyPI
+RUN pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple && \
+    pip install --no-cache-dir -r /app/requirements.runtime.txt \
     && pip install --no-cache-dir --upgrade \
     "urllib3>=2.6.3" \
     "pyasn1>=0.6.2" \

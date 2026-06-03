@@ -79,6 +79,14 @@ def _is_local_tunnel_up(url: str) -> bool:
 
 
 def make_engine():
+    # Build options string: statement_timeout + optional search_path
+    # search_path 走环境变量,默认 public(兼容老部署);
+    # 部署到共享 PG schema 时,设 PG_SEARCH_PATH=incidentfox,public
+    options_parts = ["-c statement_timeout=30000"]
+    search_path = os.getenv("PG_SEARCH_PATH")
+    if search_path:
+        options_parts.append(f"-c search_path={search_path}")
+
     return create_engine(
         get_database_url(),
         pool_pre_ping=True,
@@ -87,7 +95,7 @@ def make_engine():
         pool_recycle=3600,
         connect_args={
             "connect_timeout": 10,
-            "options": "-c statement_timeout=30000",  # 30 second query timeout
+            "options": " ".join(options_parts),
         },
     )
 

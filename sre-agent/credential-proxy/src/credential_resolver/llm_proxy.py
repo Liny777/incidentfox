@@ -45,6 +45,11 @@ router = APIRouter()
 # Suppress litellm's verbose logging
 litellm.suppress_debug_info = True
 
+# Skip TLS verification for internal LLM gateways that use a private/self-signed CA
+# (e.g. corporate on-prem gateways). Controlled by env so it stays opt-in.
+if os.getenv("LLM_SSL_VERIFY", "true").lower() in ("false", "0", "no"):
+    litellm.ssl_verify = False
+
 
 # ---------------------------------------------------------------------------
 # Model detection
@@ -487,6 +492,12 @@ async def _forward_to_provider(
     if provider == "ollama":
         host = (creds or {}).get("host", "http://localhost:11434")
         litellm_kwargs["api_base"] = host
+    elif provider == "openai":
+        # Support custom OpenAI-compatible gateways (e.g. internal on-prem LLM gateway).
+        # When integrations.openai.api_base is set, route there instead of api.openai.com.
+        api_base = (creds or {}).get("api_base", "")
+        if api_base:
+            litellm_kwargs["api_base"] = api_base.rstrip("/")
     elif provider == "azure":
         litellm_kwargs["api_base"] = (creds or {}).get("api_base", "")
         litellm_kwargs["api_version"] = (creds or {}).get("api_version", "2024-06-01")

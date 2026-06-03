@@ -5,7 +5,7 @@ category: 04-operations
 doc_type: 目录索引
 status: active
 created_at: 2026-06-01
-updated_at: 2026-06-01
+updated_at: 2026-06-03
 owners: ["Liny777"]
 tags: ["index", "operations", "deploy", "runbook"]
 summary: "部署、配置、运行手册类文档入口。"
@@ -21,7 +21,7 @@ related_artifacts: []
 
 ## 当前文档与资产
 
-- （无）
+- [huawei-onprem-deploy.md](huawei-onprem-deploy.md) — IncidentFox 华为内网离线部署指南（DOC-IFX-OPS-20260603-001）：三机 + 远端 PG + 内网 MiniMax 网关,含 5 处源码定制、配置、打包、踩坑排查。
 
 ## 收录建议
 
