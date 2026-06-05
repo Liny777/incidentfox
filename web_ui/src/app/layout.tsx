@@ -22,6 +22,8 @@ export const metadata: Metadata = {
   description: "AI-Powered SRE Platform",
 };
 
+const BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH || "/incident/web-ui";
+
 export default function RootLayout({
   children,
 }: Readonly<{
@@ -30,6 +32,47 @@ export default function RootLayout({
   return (
     <html lang="en" className="h-full" suppressHydrationWarning>
       <head>
+        {/* CRITICAL: basePath fetch patch — MUST run before any client fetch.
+            Next.js basePath auto-prefixes next/link & assets, but NOT native fetch().
+            This patches window.fetch to prefix same-origin root-relative paths so all
+            55+ `fetch('/api/...')` calls reach `/incident/web-ui/api/...` under the gateway. */}
+        <script
+          dangerouslySetInnerHTML={{
+            __html: `
+              (function() {
+                try {
+                  var BASE = ${JSON.stringify(BASE_PATH)};
+                  if (!BASE || window.__ifoxFetchPatched) return;
+                  window.__ifoxFetchPatched = true;
+                  var of = window.fetch.bind(window);
+                  function needsPrefix(p) {
+                    return typeof p === 'string'
+                      && p.charAt(0) === '/'
+                      && p.indexOf('//') !== 0
+                      && p.indexOf(BASE + '/') !== 0
+                      && p !== BASE;
+                  }
+                  window.fetch = function(input, init) {
+                    try {
+                      if (needsPrefix(input)) {
+                        input = BASE + input;
+                      } else if (input && typeof input === 'object' && typeof input.url === 'string') {
+                        var origin = window.location.origin;
+                        if (input.url.indexOf(origin) === 0) {
+                          var path = input.url.substring(origin.length);
+                          if (needsPrefix(path)) {
+                            input = new Request(origin + BASE + path, input);
+                          }
+                        }
+                      }
+                    } catch (e) {}
+                    return of(input, init);
+                  };
+                } catch (e) {}
+              })();
+            `,
+          }}
+        />
         {/* CRITICAL: This script MUST run before any rendering to prevent flash */}
         <script
           dangerouslySetInnerHTML={{

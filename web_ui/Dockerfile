@@ -3,7 +3,9 @@ WORKDIR /app
 
 FROM base AS deps
 COPY package.json package-lock.json ./
-RUN npm ci
+# Use Huawei npm mirror to avoid registry.npmjs.org timeouts
+RUN npm config set registry https://mirrors.huaweicloud.com/repository/npm/ && \
+    npm ci
 
 # Install platform-specific native binaries based on target architecture
 # TARGETARCH is automatically set by Docker during multi-platform builds (amd64 or arm64)
@@ -23,9 +25,10 @@ RUN npm run build
 FROM node:20-bookworm-slim AS runner
 WORKDIR /app
 
-# Install security patches and remove npm/corepack (not needed at runtime, fixes CVE-2026-24842)
-RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/* && \
-    rm -rf /usr/local/lib/node_modules /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack
+# Remove npm/corepack (not needed at runtime, also removes CVE-2026-24842 risk)
+# Note: apt-get upgrade skipped to avoid issues with corporate proxies/VPN intercepting apt mirrors.
+# For air-gapped internal deployment, OS-level CVEs can be handled by host scanning instead.
+RUN rm -rf /usr/local/lib/node_modules /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack
 
 ENV NODE_ENV=production
 ENV PORT=3000

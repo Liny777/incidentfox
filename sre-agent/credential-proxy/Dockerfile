@@ -15,8 +15,9 @@ COPY pyproject.toml README.md ./
 # Copy source code (needed for install)
 COPY src/ src/
 
-# Install dependencies
-RUN uv pip install --system --no-cache .
+# Install dependencies (use Tsinghua PyPI mirror)
+RUN uv pip install --system --no-cache . \
+    --index-url https://pypi.tuna.tsinghua.edu.cn/simple
 
 # Self-signed TLS cert for HTTPS listener (gh CLI requires HTTPS).
 # Not a real secret — just satisfies gh's HTTPS requirement for pod-internal traffic.
